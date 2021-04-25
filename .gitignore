@@ -130,3 +130,6 @@ dmypy.json
 
 # misc
 tmp/
+
+# IDE
+.idea/

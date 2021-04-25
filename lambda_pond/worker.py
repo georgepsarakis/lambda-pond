@@ -14,6 +14,7 @@ class Configuration:
     result_writer: Connection
     task_reader: Connection
     task_writer: Connection
+    lock: threading.Lock
     process_name: str = None
     on_after_fork: Callable = None
     on_shutdown: Callable = None
@@ -38,10 +39,28 @@ class Timer:
         return time.monotonic() - self._start
 
 
-class Worker:
-    _TASK_POLLING_INTERVAL = 10 ** -9
-    SHUTDOWN_SIGNAL = (None, None, None, None)
+DURATION_MICROSECOND = 10 ** -6
+DURATION_MILLISECOND = 10 ** -3
 
+
+_SHUTDOWN_OBJECT = object()
+
+
+def _shutdown(*args, **kwargs):
+    return _SHUTDOWN_OBJECT
+
+
+class Executor:
+    def __init__(self, function_registry):
+        self._function_registry = function_registry
+
+    def run(self, task: AsyncTask):
+        fn = task.function
+        callable_fn = self._function_registry.get(fn, fn)
+        return callable_fn(*task.args, **task.kwargs)
+
+
+class Worker:
     def __init__(self, config: Configuration):
         self._config = config
         self._task_reader = self.config.task_reader
@@ -59,6 +78,11 @@ class Worker:
         self._timeout_watcher_thread: threading.Thread = None
         self._timeout_exceeded = False
         self._stopped = False
+        self._function_registry = {}
+        self._executor = Executor(self._function_registry)
+
+    def set_function_registry(self, mapping: dict):
+        self._function_registry.update(mapping)
 
     @property
     def timer(self) -> Timer:
@@ -111,7 +135,6 @@ class Worker:
         )
         self._process.start()
         self._pid = self._process.pid
-        print('timeout:', self._config.task_timeout)
         if self._config.task_timeout is not None:
             self._timeout_watcher_thread = threading.Thread(target=self._monitor_task_timeout)
             self._timeout_watcher_thread.daemon = True
@@ -120,17 +143,14 @@ class Worker:
 
     def _monitor_task_timeout(self):
         while not self.stopped:
-            time.sleep(10**-6)
+            time.sleep(DURATION_MILLISECOND)
             if self._timer.elapsed() > self._config.task_timeout:
-                with self._state_lock:
+                with self._config.lock:
                     print('timeout exceeded!')
                     self._timeout_exceeded = True
                     self._process.terminate()
                     self._timer.reset()
                     self.stop(force=True)
-
-    def set_state_lock(self, lck):
-        self._state_lock = lck
 
     @property
     def process(self) -> multiprocessing.Process:
@@ -140,25 +160,30 @@ class Worker:
         if self.config.on_after_fork is not None:
             self.config.on_after_fork()
 
+        executor = self._executor.run
+        task_deserializer = AsyncTask.deserialize
         while True:
-            if task_reader.poll(self._TASK_POLLING_INTERVAL):
+            if task_reader.poll(DURATION_MICROSECOND):
                 message = task_reader.recv()
-                if message == self.SHUTDOWN_SIGNAL:
-                    break
-                task = AsyncTask.deserialize(message)
+                task = task_deserializer(message)
                 try:
-                    result = task.execute()
+                    result = executor(task)
+                    if result is _SHUTDOWN_OBJECT:
+                        break
                 except Exception as e:
                     result = TaskError(e)
-                print("result >>>", result)
                 result_writer.send((task.identifier, result))
 
         if self.config.on_shutdown is not None:
             self.config.on_shutdown()
 
-    def send(self, task) -> bool:
+    def send(self, task: AsyncTask) -> bool:
+        self.set_current(task)
+        serialized_task = task.serialize()
         try:
-            self._task_writer.send(task)
+            self._task_writer.send(serialized_task)
+        except ConnectionError:
+            self.stop(force=True, graceful=False)
         except OSError:
             return False
         return True
@@ -170,23 +195,25 @@ class Worker:
     def stopped(self):
         return self._stopped
 
-    def stop(self, force=False):
+    def stop(self, force=False, graceful=True):
         self._stopped = True
-        self.send(self.SHUTDOWN_SIGNAL)
+        if graceful:
+            self.send(AsyncTask(fn=_shutdown))
         total = 0
-        poll_interval = 10**-5
         while self.process.is_alive():
-            time.sleep(poll_interval)
-            total += poll_interval
+            time.sleep(DURATION_MICROSECOND)
+            total += DURATION_MICROSECOND
             if force and total > 0.1:
                 self._process.terminate()
                 if total > 1:
                     self._process.kill()
         print(f'closing {self._pid}')
-        self.config.task_reader.close()
-        self.config.task_writer.close()
-        self.config.result_reader.close()
-        self.config.result_writer.close()
+        try:
+            self.config.task_reader.close()
+            self.config.task_writer.close()
+            self.config.result_reader.close()
+            self.config.result_writer.close()
+        # TODO: check errors
+        except (ConnectionError, OSError):
+            pass
         return self.process.terminate()
-
-

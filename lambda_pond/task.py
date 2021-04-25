@@ -26,21 +26,37 @@ class TaskWrapper:
     kwargs: Dict
     identifier: str
 
-    def execute(self):
-        return self.function(*self.args, **self.kwargs)
+    def execute(self, registry=None):
+        if registry is not None and isinstance(self.function, str):
+            function = registry[self.function]
+        else:
+            function = self.function
+        if function is None:
+            return None
+        return function(*self.args, **self.kwargs)
 
 
 class AsyncTask:
     _NO_RESULT = object()
 
-    def __init__(self, fn, args=None, kwargs=None):
-        if not callable(fn):
-            raise ValueError(f'{fn} not callable')
+    def __init__(self, fn, args=None, kwargs=None, identifier=None):
         self._fn = fn
         self._args = args or ()
         self._kwargs = kwargs or {}
         self._result = self._NO_RESULT
-        self._id = str(uuid.uuid4())
+        self._id = identifier or str(uuid.uuid4())
+
+    @property
+    def args(self):
+        return self._args
+
+    @property
+    def kwargs(self):
+        return self._kwargs
+
+    @property
+    def function(self):
+        return self._fn
 
     @property
     def failed(self):
@@ -63,13 +79,13 @@ class AsyncTask:
         return self.identifier, self._fn, self._args, self._kwargs
 
     @classmethod
-    def deserialize(cls, serialized) -> TaskWrapper:
+    def deserialize(cls, serialized) -> 'AsyncTask':
         identifier, fn, args, kwargs = serialized
-        return TaskWrapper(
-            identifier=identifier,
-            function=fn,
+        return cls(
+            fn=fn,
             args=args,
-            kwargs=kwargs
+            kwargs=kwargs,
+            identifier=identifier
         )
 
     @property
@@ -78,3 +94,10 @@ class AsyncTask:
 
     def fulfil(self, result):
         self._result = result
+
+    def __repr__(self) -> str:
+        return f'<{self.__class__.__name__} fn={self._fn},args={self._args},' \
+               f'kwargs={self._kwargs},ready={self.ready()}>'
+
+    def __str__(self) -> str:
+        return repr(self)
